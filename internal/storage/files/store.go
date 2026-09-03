@@ -3,8 +3,10 @@ package files
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,6 +30,14 @@ func NewStore(dir string) (*Store, error) {
 		return nil, fmt.Errorf("создание каталога хранилища %s: %w", dir, err)
 	}
 	return &Store{dir: dir}, nil
+}
+
+func (s *Store) openRoot() (*os.Root, error) {
+	root, err := os.OpenRoot(s.dir)
+	if err != nil {
+		return nil, fmt.Errorf("открытие каталога хранилища %s: %w", s.dir, err)
+	}
+	return root, nil
 }
 
 // Save копирует файл в хранилище под уникальным именем и возвращает путь и размер копии.
@@ -55,10 +65,16 @@ func (s *Store) Save(ctx context.Context, srcPath string) (string, int64, error)
 	}
 	defer func() { _ = src.Close() }()
 
-	dstPath := filepath.Join(s.dir, uuid.NewString()+strings.ToLower(filepath.Ext(srcPath)))
-	dst, err := os.Create(dstPath)
+	root, err := s.openRoot()
 	if err != nil {
-		return "", 0, fmt.Errorf("создание файла %s: %w", dstPath, err)
+		return "", 0, err
+	}
+	defer func() { _ = root.Close() }()
+
+	name := uuid.NewString() + strings.ToLower(filepath.Ext(srcPath))
+	dst, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", 0, fmt.Errorf("создание файла %s: %w", name, err)
 	}
 
 	written, err := io.Copy(dst, src)
@@ -66,10 +82,10 @@ func (s *Store) Save(ctx context.Context, srcPath string) (string, int64, error)
 		err = closeErr
 	}
 	if err != nil {
-		_ = os.Remove(dstPath)
+		_ = root.Remove(name)
 		return "", 0, fmt.Errorf("копирование файла в хранилище: %w", err)
 	}
-	return dstPath, written, nil
+	return filepath.Join(s.dir, name), written, nil
 }
 
 // Remove удаляет файл из хранилища.
@@ -77,7 +93,18 @@ func (s *Store) Remove(path string) error {
 	if strings.TrimSpace(path) == "" {
 		return nil
 	}
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+	name, err := filepath.Rel(s.dir, path)
+	if err != nil {
+		return fmt.Errorf("%w: файл %s вне каталога хранилища %s", domain.ErrInvalidArgument, path, s.dir)
+	}
+
+	root, err := s.openRoot()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+
+	if err := root.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("удаление файла %s: %w", path, err)
 	}
 	return nil

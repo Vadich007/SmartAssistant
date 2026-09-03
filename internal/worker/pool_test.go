@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/google/uuid"
@@ -132,22 +133,6 @@ func (p *fakeProcessor) releasedCount() int {
 	return len(p.released)
 }
 
-func waitDone(t *testing.T, wg *sync.WaitGroup, timeout time.Duration) {
-	t.Helper()
-
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(timeout):
-		t.Fatal("обработка задач не завершилась за отведённое время")
-	}
-}
-
 func testConfig(concurrency int) worker.Config {
 	return worker.Config{
 		WorkerID:        "test-worker",
@@ -163,20 +148,23 @@ func testConfig(concurrency int) worker.Config {
 func TestPoolProcessesAllJobs(t *testing.T) {
 	t.Parallel()
 
-	proc := newFakeProcessor(12)
-	pool := worker.New(proc, testConfig(3), nil)
+	synctest.Test(t, func(t *testing.T) {
+		proc := newFakeProcessor(12)
+		pool := worker.New(proc, testConfig(3), nil)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	finished := make(chan error, 1)
-	go func() { finished <- pool.Run(ctx) }()
+		ctx, cancel := context.WithCancel(context.Background())
+		finished := make(chan error, 1)
+		go func() { finished <- pool.Run(ctx) }()
 
-	waitDone(t, proc.wg, 5*time.Second)
-	cancel()
-	require.NoError(t, <-finished)
+		proc.wg.Wait()
+		cancel()
+		require.NoError(t, <-finished)
 
-	assert.Equal(t, 12, proc.processedCount())
-	assert.Zero(t, proc.releasedCount())
-	assert.Positive(t, proc.staleRecovery.Load(), "при старте задачи с истёкшей арендой должны восстанавливаться")
+		assert.Equal(t, 12, proc.processedCount())
+		assert.Zero(t, proc.releasedCount())
+		assert.Positive(t, proc.staleRecovery.Load(),
+			"при старте задачи с истёкшей арендой должны восстанавливаться")
+	})
 }
 
 func TestPoolRespectsConcurrencyLimit(t *testing.T) {
@@ -184,97 +172,96 @@ func TestPoolRespectsConcurrencyLimit(t *testing.T) {
 
 	const concurrency = 3
 
-	proc := newFakeProcessor(30)
-	proc.processDelay = 10 * time.Millisecond
+	synctest.Test(t, func(t *testing.T) {
+		proc := newFakeProcessor(30)
+		proc.processDelay = 10 * time.Millisecond
 
-	cfg := testConfig(concurrency)
-	cfg.BatchSize = 10
-	pool := worker.New(proc, cfg, nil)
+		cfg := testConfig(concurrency)
+		cfg.BatchSize = 10
+		pool := worker.New(proc, cfg, nil)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	finished := make(chan error, 1)
-	go func() { finished <- pool.Run(ctx) }()
+		ctx, cancel := context.WithCancel(context.Background())
+		finished := make(chan error, 1)
+		go func() { finished <- pool.Run(ctx) }()
 
-	waitDone(t, proc.wg, 10*time.Second)
-	cancel()
-	require.NoError(t, <-finished)
+		proc.wg.Wait()
+		cancel()
+		require.NoError(t, <-finished)
 
-	assert.Equal(t, 30, proc.processedCount())
-	assert.LessOrEqual(t, int(proc.maxInFlight.Load()), concurrency,
-		"одновременно обрабатывалось больше задач, чем разрешено")
-	assert.Positive(t, proc.maxInFlight.Load())
+		assert.Equal(t, 30, proc.processedCount())
+		assert.LessOrEqual(t, int(proc.maxInFlight.Load()), concurrency,
+			"одновременно обрабатывалось больше задач, чем разрешено")
+		assert.Positive(t, proc.maxInFlight.Load())
+	})
 }
 
 func TestPoolReleasesJobsOnShutdown(t *testing.T) {
 	t.Parallel()
 
-	proc := newFakeProcessor(2)
-	proc.hold = make(chan struct{})
+	synctest.Test(t, func(t *testing.T) {
+		proc := newFakeProcessor(2)
+		proc.hold = make(chan struct{})
 
-	pool := worker.New(proc, testConfig(2), nil)
+		pool := worker.New(proc, testConfig(2), nil)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	finished := make(chan error, 1)
-	go func() { finished <- pool.Run(ctx) }()
+		ctx, cancel := context.WithCancel(context.Background())
+		finished := make(chan error, 1)
+		go func() { finished <- pool.Run(ctx) }()
 
-	require.Eventually(t, func() bool { return proc.inFlight.Load() == 2 },
-		2*time.Second, 5*time.Millisecond)
+		synctest.Wait()
+		require.EqualValues(t, 2, proc.inFlight.Load())
 
-	cancel()
-	select {
-	case err := <-finished:
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("пул не остановился по отмене context")
-	}
+		cancel()
+		require.NoError(t, <-finished)
 
-	assert.Zero(t, proc.processedCount(), "прерванные задачи не считаются обработанными")
-	assert.Equal(t, 2, proc.releasedCount(), "прерванные задачи должны вернуться в очередь")
+		assert.Zero(t, proc.processedCount(), "прерванные задачи не считаются обработанными")
+		assert.Equal(t, 2, proc.releasedCount(), "прерванные задачи должны вернуться в очередь")
+	})
 }
 
 func TestPoolStopsImmediatelyOnCancelledContext(t *testing.T) {
 	t.Parallel()
 
-	proc := newFakeProcessor(0)
-	pool := worker.New(proc, testConfig(2), nil)
+	synctest.Test(t, func(t *testing.T) {
+		proc := newFakeProcessor(0)
+		pool := worker.New(proc, testConfig(2), nil)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
 
-	done := make(chan error, 1)
-	go func() { done <- pool.Run(ctx) }()
-
-	select {
-	case err := <-done:
-		require.NoError(t, err)
-	case <-time.After(2 * time.Second):
-		t.Fatal("пул должен сразу завершаться при отменённом context")
-	}
-	assert.Zero(t, proc.processedCount())
+		start := time.Now()
+		require.NoError(t, pool.Run(ctx))
+		assert.Zero(t, time.Since(start), "пул должен сразу завершаться при отменённом context")
+		assert.Zero(t, proc.processedCount())
+	})
 }
 
 func TestPoolSurvivesClaimErrors(t *testing.T) {
 	t.Parallel()
 
-	proc := newFakeProcessor(0)
-	proc.claimErr = errors.New("база данных недоступна")
+	synctest.Test(t, func(t *testing.T) {
+		proc := newFakeProcessor(0)
+		proc.claimErr = errors.New("база данных недоступна")
 
-	pool := worker.New(proc, testConfig(2), nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
-	defer cancel()
+		pool := worker.New(proc, testConfig(2), nil)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+		defer cancel()
 
-	require.NoError(t, pool.Run(ctx))
-	assert.Zero(t, proc.releasedCount())
+		require.NoError(t, pool.Run(ctx))
+		assert.Zero(t, proc.releasedCount())
+	})
 }
 
 func TestPoolAppliesDefaults(t *testing.T) {
 	t.Parallel()
 
-	proc := newFakeProcessor(0)
-	pool := worker.New(proc, worker.Config{}, nil)
+	synctest.Test(t, func(t *testing.T) {
+		proc := newFakeProcessor(0)
+		pool := worker.New(proc, worker.Config{}, nil)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
 
-	require.NoError(t, pool.Run(ctx))
+		require.NoError(t, pool.Run(ctx))
+	})
 }
